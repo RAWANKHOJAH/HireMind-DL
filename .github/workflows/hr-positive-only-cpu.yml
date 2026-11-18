@@ -1,0 +1,71 @@
+name: HireMind positive-only HR evidence CPU ablation
+on:
+  push:
+    branches: [research/hr-positive-evidence-cpu-20261118]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  train_one:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      HIREMIND_MAX_LEN: "512"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned CPU model dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Retrieve Hams original code, original frozen split
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+          mkdir -p "$GITHUB_WORKSPACE/results"
+      - name: Test positive-only extractor and isolate only one input modification
+        run: |
+          cp research/hr_evidence.py /tmp/Senior-2/evaluation/knowledge/hr_evidence.py
+          cp research/hr_positive_evidence.py /tmp/Senior-2/evaluation/knowledge/hr_positive_evidence.py
+          cd /tmp/Senior-2/evaluation/knowledge
+          python - <<'PY'
+          from hr_positive_evidence import hr_evidence_line
+          assert hr_evidence_line("Marketing assistant","Accountant job. CPA required, Bachelor degree.")==""
+          assert "Occupation evidence:accounting" in hr_evidence_line("I was an accountant.","Accountant needed.")
+          assert "not stated" not in hr_evidence_line("CPA-qualified certified public accountant.","CPA preferred.")
+          from pathlib import Path
+          p=Path("train_knowledge.py");s=p.read_text()
+          needle="from knowledge import features, knowledge_line  # noqa: E402"
+          assert s.count(needle)==1
+          s=s.replace(needle,needle+"\nfrom hr_positive_evidence import hr_evidence_line")
+          target='knowledge_line(features(cv, job)) + "\\n" + job'
+          assert s.count(target)==1
+          replace='knowledge_line(features(cv, job)) + "\\n" + (hr_evidence_line(cv, job) + "\\n" if hr_evidence_line(cv, job) else "") + job'
+          p.write_text(s.replace(target,replace))
+          PY
+          python -m py_compile /tmp/Senior-2/evaluation/knowledge/train_knowledge.py
+      - name: Actual seed 42 CPU training, original TRAIN vs VALIDATION, no test
+        run: |
+          cd /tmp/Senior-2
+          HIREMIND_RESULTS="$GITHUB_WORKSPACE/results" \
+            python -u evaluation/knowledge/train_knowledge.py \
+            --dl /tmp/HireMind-DL --seed 42 --variant hr_positive \
+            --knowledge 1 --epochs 3 --device cpu --save-preds \
+            --save-weights "$GITHUB_WORKSPACE/results"
+      - name: Write provenance
+        if: always()
+        run: |
+          printf 'variant=hr_positive\nseed=42\noriginal_Hams_source=cdab258a201141706d572ba03a4a7b9fb60708db\noriginal_DL=1f22f34462c400f884bb0a00f061dbea0bd687d5\nno_test=true\nsingle_factor=positive_only_HR_category_evidence\nno_HR_policy_scores_in_public_training_data=true\n' > "$GITHUB_WORKSPACE/results/PROVENANCE.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hr-positive-only-s42
+          path: results/
+          if-no-files-found: warn
+          retention-days: 7
