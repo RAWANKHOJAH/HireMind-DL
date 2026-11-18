@@ -1,0 +1,136 @@
+name: HireMind HR-category evidence matched CPU research
+on:
+  push:
+    branches: [research/hr-evidence-boundary-cpu-20261118]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  HIREMIND_MAX_LEN: "512"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned CPU requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Checkout original frozen data manifest and original Knowledge v1
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+      - name: Unit tests + per-split feature coverage, no test
+        run: |
+          python -m py_compile research/hr_evidence.py research/hr_preflight.py
+          python -u research/hr_preflight.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hr-evidence-preflight
+          path: preflight_hr/
+          if-no-files-found: warn
+          retention-days: 7
+
+  train:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [knowledge_v1, hr_evidence]
+        seed: [42]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned CPU requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Fetch immutable reference training code and data manifest
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+          mkdir -p "$GITHUB_WORKSPACE/run_results"
+      - name: Add evidence line only in treatment branch
+        env:
+          ARM: ${{ matrix.arm }}
+        run: |
+          if [ "$ARM" = "hr_evidence" ]; then
+            cp research/hr_evidence.py /tmp/Senior-2/evaluation/knowledge/hr_evidence.py
+            python - <<'PY'
+          from pathlib import Path
+          p=Path("/tmp/Senior-2/evaluation/knowledge/train_knowledge.py")
+          s=p.read_text()
+          needle="from knowledge import features, knowledge_line  # noqa: E402"
+          assert s.count(needle)==1, "Hams training source changed: STOP"
+          s=s.replace(needle,needle+"\nfrom hr_evidence import hr_evidence_line")
+          target='knowledge_line(features(cv, job)) + "\\n" + job'
+          assert s.count(target)==1, "Unexpected training input path: STOP"
+          substitute='knowledge_line(features(cv, job)) + "\\n" + (hr_evidence_line(cv, job) + "\\n" if hr_evidence_line(cv, job) else "") + job'
+          s=s.replace(target,substitute)
+          p.write_text(s)
+          PY
+          fi
+          python -m py_compile /tmp/Senior-2/evaluation/knowledge/train_knowledge.py
+      - name: Train original 3-epoch BERT-Tiny on same TRAIN and VALIDATION
+        env:
+          ARM: ${{ matrix.arm }}
+          SEED: ${{ matrix.seed }}
+        run: |
+          cd /tmp/Senior-2
+          HIREMIND_RESULTS="$GITHUB_WORKSPACE/run_results" \
+            python -u evaluation/knowledge/train_knowledge.py \
+            --dl /tmp/HireMind-DL --seed "$SEED" --variant "$ARM" \
+            --knowledge 1 --epochs 3 --device cpu --save-preds \
+            --save-weights "$GITHUB_WORKSPACE/run_results"
+      - name: Immutable provenance, no data dumps
+        if: always()
+        env:
+          ARM: ${{ matrix.arm }}
+          SEED: ${{ matrix.seed }}
+        run: |
+          printf 'arm=%s\nseed=%s\noriginal_knowledge_line_unchanged=true\nintervention=compact_education_certification_and_occupation_evidence\noriginal_train_source_commit=cdab258a201141706d572ba03a4a7b9fb60708db\noriginal_DL_source_commit=1f22f34462c400f884bb0a00f061dbea0bd687d5\nno_test=true\nno_hr_policy_per_dataset_job=true\n' "$ARM" "$SEED" > "$GITHUB_WORKSPACE/run_results/PROVENANCE.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: 'hr-evidence-${{ matrix.arm }}-s${{ matrix.seed }}'
+          path: run_results/
+          if-no-files-found: warn
+          retention-days: 7
+
+  verified_comparison:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy pandas==2.2.3 scikit-learn==1.6.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hr-evidence-*-s42
+          path: /tmp/hr_runs
+      - name: Recompute all metrics, compare row IDs, check weight SHA, decide
+        run: python -u research/compare_hr_evidence.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hr-evidence-verified-comparison
+          path: verified_comparison/
+          retention-days: 7
