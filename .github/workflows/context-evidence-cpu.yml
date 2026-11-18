@@ -1,0 +1,121 @@
+name: HireMind job-conditioned CV evidence CPU pilot
+on:
+  push:
+    branches:
+      - research/context-evidence-pilot-20261118
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evidence_preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HIREMIND_MAX_LEN: "512"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Fetch pinned sources and historical validation predictions
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+          git clone -q -b final-results --depth 1 https://github.com/Hams770/Senior-2.git /tmp/final-results
+      - name: Audit exact matched-skill and JD term visibility for 1,162 cases
+        run: |
+          python -m py_compile research/job_conditioned_cv.py research/evidence_preflight.py
+          python -u research/evidence_preflight.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: context-evidence-coverage-diagnostic
+          path: pilot_preflight/
+          if-no-files-found: warn
+          retention-days: 7
+
+  matched_training:
+    needs: evidence_preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [knowledge_v1, cv_evidence]
+        seed: [42]
+    env:
+      HIREMIND_MAX_LEN: "512"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install exact Hams training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Fetch pinned original training code and split
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+          mkdir -p "$GITHUB_WORKSPACE/pilot_results"
+      - name: Apply one factor to treatment only
+        env:
+          ARM: ${{ matrix.arm }}
+        run: |
+          if [ "$ARM" = "cv_evidence" ]; then
+            cp research/job_conditioned_cv.py /tmp/Senior-2/evaluation/knowledge/job_conditioned_cv.py
+            python - <<'PY'
+          import pathlib
+          p=pathlib.Path("/tmp/Senior-2/evaluation/knowledge/train_knowledge.py")
+          s=p.read_text()
+          needle='        if use_knowledge:\n'
+          addition=(
+              '        if os.environ.get("HIREMIND_CV_REORDER") == "1":\n'
+              '            from job_conditioned_cv import make_cv\n'
+              '            d["resume_text"] = [make_cv(cv, job, tok) for cv, job in zip(d.resume_text, d.job_description_text)]\n'
+          )
+          assert s.count(needle)==1, 'Unexpected upstream training code, STOP'
+          p.write_text(s.replace(needle,addition+needle))
+          PY
+          fi
+          python -m py_compile /tmp/Senior-2/evaluation/knowledge/train_knowledge.py
+      - name: Train matched BERT-Tiny on original 4993 training pairs (no test)
+        env:
+          ARM: ${{ matrix.arm }}
+          SEED: ${{ matrix.seed }}
+        run: |
+          cd /tmp/Senior-2
+          if [ "$ARM" = "cv_evidence" ]; then export HIREMIND_CV_REORDER=1; fi
+          HIREMIND_RESULTS="$GITHUB_WORKSPACE/pilot_results" \
+          python -u evaluation/knowledge/train_knowledge.py \
+            --dl /tmp/HireMind-DL --seed "$SEED" --variant "$ARM" --knowledge 1 \
+            --epochs 3 --device cpu --save-preds --save-weights "$GITHUB_WORKSPACE/pilot_results"
+      - name: Save protocol and provenance
+        if: always()
+        env:
+          ARM: ${{ matrix.arm }}
+          SEED: ${{ matrix.seed }}
+        run: |
+          printf 'arm=%s\nseed=%s\nno_test=true\nsource_senior_commit=cdab258a201141706d572ba03a4a7b9fb60708db\nsource_dl_commit=1f22f34462c400f884bb0a00f061dbea0bd687d5\nsingle_change=CV_sentence_order_for_treatment_only\n' "$ARM" "$SEED" > "$GITHUB_WORKSPACE/pilot_results/PROVENANCE.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: 'context-evidence-${{ matrix.arm }}-s${{ matrix.seed }}'
+          path: pilot_results/
+          if-no-files-found: warn
+          retention-days: 7
