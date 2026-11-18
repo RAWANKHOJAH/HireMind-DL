@@ -1,0 +1,52 @@
+name: HireMind all4993 downweight CPU corrected run
+on:
+  push:
+    branches: [research/all4993-weight-fix-20261118]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  HIREMIND_MAX_LEN: "512"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+
+jobs:
+  weighted_training_only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install original CPU dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Fetch fixed original sources
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+      - name: Reuse previous fivefold audit, do NOT re-run OOF
+        uses: actions/download-artifact@v4
+        with:
+          name: all4993-label-audit
+          run-id: 44294276832
+          github-token: ${{ github.token }}
+          path: /tmp/label_audit
+      - name: Confirm precise 4993-row mapping and train weighted CE
+        run: |
+          python -m py_compile research/train_label_arm.py
+          python -u research/train_label_arm.py --arm weight
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: all4993-label-weight-fixed
+          path: model_results/
+          if-no-files-found: warn
+          retention-days: 7
