@@ -1,0 +1,84 @@
+name: HireMind isolated CPU knowledge quality pilot
+on:
+  push:
+    branches:
+      - research/knowledge-quality-cpu-20261118
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matched_training:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [knowledge_v1, quality_overlay]
+        seed: [42]
+    env:
+      HIREMIND_MAX_LEN: "512"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - name: Checkout isolated experiment only
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install exact training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.51.3 pandas==2.2.3 scikit-learn==1.6.1 huggingface-hub==0.30.2 numpy
+      - name: Checkout Hams training code and frozen DL splits
+        run: |
+          git clone -q https://github.com/Hams770/Senior-2.git /tmp/Senior-2
+          git -C /tmp/Senior-2 checkout -q cdab258a201141706d572ba03a4a7b9fb60708db
+          git clone -q https://github.com/Hams770/HireMind-DL.git /tmp/HireMind-DL
+          git -C /tmp/HireMind-DL checkout -q 1f22f34462c400f884bb0a00f061dbea0bd687d5
+          mkdir -p "$GITHUB_WORKSPACE/pilot_results"
+      - name: Change one input feature extractor only for treatment
+        run: |
+          cp /tmp/Senior-2/evaluation/knowledge/knowledge.py /tmp/Senior-2/evaluation/knowledge/knowledge_orig.py
+          if [ "${{ matrix.arm }}" = "quality_overlay" ]; then
+            cp research/knowledge_quality_overlay.py /tmp/Senior-2/evaluation/knowledge/knowledge.py
+          fi
+          python -m py_compile /tmp/Senior-2/evaluation/knowledge/knowledge.py
+      - name: Check extractor on a synthetic negated optional example
+        run: |
+          cd /tmp/Senior-2/evaluation/knowledge
+          python - <<'PY'
+          from knowledge import features, knowledge_line
+          f=features('I have no experience in Python.','Python is preferred but optional.')
+          print('Arm:', '${{ matrix.arm }}')
+          print('Knowledge line:', knowledge_line(f))
+          if '${{ matrix.arm }}' == 'quality_overlay':
+              assert f['n_found']==0 and f['n_job_skills']==0, f
+          PY
+      - name: Train actual BERT-Tiny on frozen TRAIN and evaluate on VALIDATION
+        run: |
+          cd /tmp/Senior-2
+          HIREMIND_RESULTS="$GITHUB_WORKSPACE/pilot_results" \
+          python -u evaluation/knowledge/train_knowledge.py \
+            --dl /tmp/HireMind-DL \
+            --seed ${{ matrix.seed }} \
+            --variant ${{ matrix.arm }} \
+            --knowledge 1 \
+            --epochs 3 \
+            --device cpu \
+            --save-preds \
+            --save-weights "$GITHUB_WORKSPACE/pilot_results"
+      - name: Collect exact provenance
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          printf 'arm=${{ matrix.arm }}\nseed=${{ matrix.seed }}\nsource_senior_commit=cdab258a201141706d572ba03a4a7b9fb60708db\nsource_dl_commit=1f22f34462c400f884bb0a00f061dbea0bd687d5\ntrain_script=Hams source unchanged\nvalidation_only=true\n' > pilot_results/PROVENANCE.txt
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'knowledge-quality-${{ matrix.arm }}-s${{ matrix.seed }}'
+          path: pilot_results/
+          retention-days: 7
