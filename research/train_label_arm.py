@@ -93,7 +93,12 @@ def main():
            for cv,jd in zip(frame.resume_text,frame.job_description_text)]
         tensors[part]=as_dataset(tokenize(inputframe,tok,512))
     if a.arm=="weight":
-        wt=torch.tensor(audit.experimental_train_weight.to_numpy(float),dtype=torch.float32)
+        wframe=pd.read_csv("/tmp/label_audit/EXPERIMENTAL_DOWNWEIGHT.csv")
+        assert len(wframe)==4993 and wframe.row_uid.is_unique
+        assert set(wframe.row_uid)==set(tr.row_uid)
+        wframe=wframe.set_index("row_uid").reindex(tr.row_uid)
+        assert wframe.experimental_train_weight.notna().all()
+        wt=torch.tensor(wframe.experimental_train_weight.to_numpy(float),dtype=torch.float32)
         assert len(wt)==4993 and wt.min()>=.25 and wt.max()<=1
         info,state=train_weighted(cfg,tensors["train"],tensors["validation"],wt,42)
     else:
@@ -120,7 +125,7 @@ def main():
       "arm":a.arm,"seed":42,"train_rows":4993,"validation_rows":1162,
       "original_labels_changed":0 if a.arm!="pseudo" else n_change,
       "experimental_pseudo_label_changes":n_change if a.arm=="pseudo" else 0,
-      "downweighted":int((audit.experimental_train_weight<1).sum()) if a.arm=="weight" else 0,
+      "downweighted":int((wt<1).sum().item()) if a.arm=="weight" else 0,
       "all_original_labels_human_approved":False,
       "test_accessed":False,
       "accuracy":b["accuracy"],"macro_f1":b["macro_f1"],
